@@ -24,7 +24,7 @@ const (
 func (t TaskType) String() string {
 	switch t {
 	case TaskWait:
-		return "Wait"
+		return "wait task coming"
 	case TaskMap:
 		return "Map"
 	case TaskReduce:
