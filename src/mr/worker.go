@@ -49,15 +49,15 @@ func Worker(
 		logTask(workerID, task)
 		switch task.TaskType {
 		case TaskWait:
-			time.Sleep(time.Millisecond * 500)
+			time.Sleep(time.Second * 10)
 
 		case TaskNone:
-			time.Sleep(time.Millisecond * 250)
+			time.Sleep(time.Second * 1)
 			return
 
 		default:
-			time.Sleep(time.Millisecond * 125)
 			workerRun(task, workerID, mapf, reducef)
+			time.Sleep(time.Second * 1)
 			task = ReqTask(workerID)
 		}
 	}
