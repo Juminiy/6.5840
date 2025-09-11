@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -40,31 +41,36 @@ func Worker(
 	reducef func(string, []string) string,
 ) {
 	workerID := getUserID() // unique and stable workerID
+	workerLog, _ := os.OpenFile("worker-"+workerID+".log", os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
+	defer workerLog.Close()
+	log.SetOutput(workerLog)
 	task := ReqTask(workerID)
 	for {
-		// logTask(task)
+		logTask(workerID, task)
 		switch task.TaskType {
 		case TaskWait:
 			time.Sleep(time.Millisecond * 500)
 
 		case TaskNone:
+			time.Sleep(time.Millisecond * 250)
 			return
 
 		default:
+			time.Sleep(time.Millisecond * 125)
 			workerRun(task, workerID, mapf, reducef)
 			task = ReqTask(workerID)
 		}
 	}
 }
 
-func logTask(task ReqTaskReply) {
+func logTask(wid string, task ReqTaskReply) {
 	detail := ""
 	if task.TaskType == TaskMap {
 		detail = fmt.Sprintf("rawfile: %s", task.RawFilename)
 	} else if task.TaskType == TaskReduce {
 		detail = fmt.Sprintf("th: %s", task.ReduceTh)
 	}
-	log.Printf("Type: %s, Detail: %s\n", task.TaskType.String(), detail)
+	log.Printf("Worker: %s, Type: %s, Detail: %s\n", wid, task.TaskType.String(), detail)
 }
 
 func workerRun(task ReqTaskReply,
@@ -114,7 +120,7 @@ func workerRun(task ReqTaskReply,
 				var kv KeyValue
 				if err := dec.Decode(&kv); err != nil {
 					if err != io.EOF {
-						log.Printf("[Worker] ReduceDecodeJSONStream filename: %s, error: %s", interfilename, err.Error())
+						log.Printf("[Worker] ReduceDecodeJSONStream filename: %s, error: %s\n", interfilename, err.Error())
 					}
 					break
 				}
@@ -150,32 +156,25 @@ func reduceInterfile(intermediate []KeyValue, oname string,
 
 	sort.Sort(ByKey(intermediate))
 
-	ofile, err := os.CreateTemp("", "oname") // os.Create(oname)
-	if err != nil {
-		log.Fatalf("[Worker] ReduceCreateOutputFile error: %s", err.Error())
-	}
+	tempfilef(oname, func(fptr *os.File) {
+		i := 0
+		for i < len(intermediate) {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
+			}
+			output := reducef(intermediate[i].Key, values)
 
-	i := 0
-	for i < len(intermediate) {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(fptr, "%v %v\n", intermediate[i].Key, output)
+
+			i = j
 		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
-		}
-		output := reducef(intermediate[i].Key, values)
-
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-
-		i = j
-	}
-	if err := os.Rename(ofile.Name(), oname); err != nil {
-		log.Fatalf("[Worker] RenameTempFile dstfilename: %s, error: %s", oname, err.Error())
-	}
-	ofile.Close()
+	})
 }
 
 // RPC Call Wrapper
@@ -220,20 +219,14 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 // file operation
 func createInterfile(interfilename string, kvs []KeyValue) {
-	fptr, err := os.CreateTemp("", interfilename) // os.Create(interfilename) // os.OpenFile(interfilename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
-	if err != nil {
-		log.Fatalf("[Worker] OpenReduceInterfile Error: filename: %s, error: %s", interfilename, err.Error())
-	}
-	defer fptr.Close()
-	enc := json.NewEncoder(fptr)
-	for _, kv := range kvs {
-		if err := enc.Encode(kv); err != nil {
-			log.Fatalf("[Worker] EncodePairToInterFile filename: %s, error: %s", interfilename, err.Error())
+	tempfilef(interfilename, func(fptr *os.File) {
+		enc := json.NewEncoder(fptr)
+		for _, kv := range kvs {
+			if err := enc.Encode(kv); err != nil {
+				log.Fatalf("[Worker] EncodePairToInterFile filename: %s, error: %s", interfilename, err.Error())
+			}
 		}
-	}
-	if err := os.Rename(fptr.Name(), interfilename); err != nil {
-		log.Fatalf("[Worker] RenameTempInterfilename: %s error: %s\n", interfilename, err.Error())
-	}
+	})
 }
 
 func readFileContent(filename string) ([]byte, error) {
@@ -264,6 +257,36 @@ func normalizedName(filename string) string {
 	return sbuf
 }
 
+func tempfilef(filename string, fn func(*os.File)) {
+	if fileExists(filename) {
+		if err := os.Remove(filename); err != nil {
+			log.Printf("[Worker] RemoveAlreadyExistsFile filename: %s, error: %s\n", filename, err.Error())
+		}
+	}
+
+	fptr, err := os.CreateTemp("", filename) // os.Create(interfilename) // os.OpenFile(interfilename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
+	if err != nil {
+		log.Fatalf("[Worker] OpenTempfile filename: %s, error: %s", filename, err.Error())
+	}
+	defer fptr.Close()
+	fn(fptr)
+
+	if err := os.Rename(fptr.Name(), filename); err != nil {
+		log.Fatalf("[Worker] RenameTempfile filename: %s, error: %s", filename, err.Error())
+	}
+}
+
+func fileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return false
+}
+
 // func interfileMerge(interfilename string, kvs []KeyValue) {
 // 	if fileExists(interfilename) {
 // 		rawcontent, err := readFileContent(interfilename)
@@ -284,17 +307,6 @@ func normalizedName(filename string) string {
 // 		log.Fatalf("[Worker] EncodeIntermediateJSON error: %s", err.Error())
 // 	}
 // 	writeContent2File(interfilename, newraw)
-// }
-
-// func fileExists(filename string) bool {
-// 	_, err := os.Stat(filename)
-// 	if err == nil {
-// 		return true
-// 	}
-// 	if errors.Is(err, os.ErrNotExist) {
-// 		return false
-// 	}
-// 	return false
 // }
 
 // func writeContent2File(filename string, content []byte) {

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type Coordinator struct {
@@ -21,6 +20,9 @@ type Coordinator struct {
 	ReduceThState *sync.Map // th -> state
 	ReduceThFiles *sync.Map // th -> intermediate-filenames
 	OutputFiles   *sync.Map // output-filenames
+
+	mapQ    *taskQ // MapTaskQueue
+	reduceQ *taskQ // ReduceTaskQueue
 
 	workers *sync.Map // taskID -> *worker
 
@@ -41,6 +43,61 @@ type worker struct {
 	output    []string
 }
 
+const taskQRegularSize = 16
+
+type taskQ struct {
+	mu sync.Mutex
+	tk []string
+}
+
+func newTaskQ(n ...int) *taskQ {
+	return &taskQ{
+		mu: sync.Mutex{},
+		tk: make([]string, 0, func() int {
+			if len(n) > 0 {
+				return n[0]
+			}
+			return taskQRegularSize
+		}()),
+	}
+}
+
+func (q *taskQ) push(tk string) *taskQ {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	en := true
+	for _, tki := range q.tk {
+		if tk == tki {
+			en = false
+			break
+		}
+	}
+	if en {
+		q.tk = append(q.tk, tk)
+	}
+	return q
+}
+
+func (q *taskQ) front() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.tk) > 0 {
+		return q.tk[0]
+	}
+	return ""
+}
+
+func (q *taskQ) pop() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.tk) > 0 {
+		tk := q.tk[0]
+		q.tk = q.tk[1:]
+		return tk
+	}
+	return ""
+}
+
 // RPC handlers for the worker to call.
 
 func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
@@ -50,22 +107,27 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 	var input string
 	switch c.phase.Load() {
 	case PhaseMap:
-		idleMapTask := getIdle(c.MapFileState) // filename
+		idleMapTask := getIdleV2(c.mapQ) // filename
 		if len(idleMapTask) != 0 {
 			reply.TaskType = TaskMap
 			reply.RawFilename = idleMapTask
 			input = idleMapTask
+			c.MapFileState.Store(input, StateReady)
 		} else {
 			reply.TaskType = TaskWait
 		}
 	case PhaseReduce:
-		idleReduceTask := getIdle(c.ReduceThState) // th
+		idleReduceTask := getIdleV2(c.reduceQ) // th
 		if len(idleReduceTask) != 0 {
 			reply.TaskType = TaskReduce
 			reply.ReduceTh = idleReduceTask
 			thFiles, _ := c.ReduceThFiles.Load(idleReduceTask)
-			reply.Interfilenames = thFiles.(sets.Set[string]).UnsortedList()
+			thFiles.(*sync.Map).Range(func(filename, _ any) bool {
+				reply.Interfilenames = append(reply.Interfilenames, filename.(string))
+				return true
+			})
 			input = idleReduceTask
+			c.ReduceThState.Store(input, StateReady)
 		}
 	}
 
@@ -105,8 +167,9 @@ func (c *Coordinator) UpdateState(args *UpdateTaskArg, reply *UpdateTaskReply) e
 		for _, interfile := range args.Filename {
 			th := parseInterfileTh(interfile)
 			c.ReduceThState.Store(th, StateIdle)
-			files, _ := c.ReduceThFiles.LoadOrStore(th, sets.New[string]())
-			files.(sets.Set[string]).Insert(interfile)
+			files, _ := c.ReduceThFiles.LoadOrStore(th, &sync.Map{})
+			files.(*sync.Map).Store(interfile, struct{}{})
+			c.reduceQ.push(th)
 			worker.output = append(worker.output, interfile)
 		}
 	case TaskReduce:
@@ -164,7 +227,7 @@ func (c *Coordinator) server() {
 // for worker-early-exit and worker-crash
 func (c *Coordinator) keepalive() {
 	for {
-		time.Sleep(time.Millisecond * 250)
+		time.Sleep(time.Second * 1)
 		disconnects := make([]string, 0)
 		curtime := time.Now()
 		c.workers.Range(func(taskID, wrk any) bool {
@@ -207,13 +270,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		ReduceThState: &sync.Map{},
 		ReduceThFiles: &sync.Map{},
 		OutputFiles:   &sync.Map{},
+		mapQ:          newTaskQ(len(files)),
+		reduceQ:       newTaskQ(nReduce),
 		workers:       &sync.Map{},
 		phase:         atomic.Value{},
 		nReduce:       nReduce,
-		workerTimeout: time.Second * 10,
+		workerTimeout: time.Second * 5,
 	}
 	for _, inputfile := range files {
 		c.MapFileState.Store(inputfile, StateIdle)
+		c.mapQ.push(inputfile)
 	}
 	c.phase.Store(PhaseMap)
 
@@ -255,6 +321,10 @@ func getIdle(tasks *sync.Map) string {
 		return true
 	})
 	return taskt
+}
+
+func getIdleV2(tk *taskQ) string {
+	return tk.pop()
 }
 
 func allCompleted(tasks *sync.Map) bool {

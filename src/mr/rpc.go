@@ -38,8 +38,9 @@ type TaskState int
 
 const (
 	StateIdle       TaskState = 0
-	StateInProgress TaskState = 1
-	StateCompleted  TaskState = 2
+	StateReady      TaskState = 1
+	StateInProgress TaskState = 2
+	StateCompleted  TaskState = 3
 )
 
 type TaskPhase int
