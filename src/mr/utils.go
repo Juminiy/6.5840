@@ -1,6 +1,8 @@
 package mr
 
-import "sync"
+import (
+	"sync"
+)
 
 type syncQ[T comparable] struct {
 	mu sync.Mutex
@@ -40,12 +42,10 @@ func (q *syncQ[T]) front() (elem T, ok bool) {
 	return elem, false
 }
 
-func (q *syncQ[T]) list() []T {
+func (q *syncQ[T]) list_read() []T {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	sl := make([]T, 0, len(q.sl))
-	copy(sl, q.sl)
-	return sl
+	return q.sl
 }
 
 func (q *syncQ[T]) empty() bool {

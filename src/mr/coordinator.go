@@ -74,6 +74,7 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 	switch c.phase.Load() {
 	case PhaseMap:
 		mSeq, ok := c.mapQ.pop()
+		log.Printf("mapSeq: %d assigned to %s\n", mSeq, args.WorkerID)
 		if ok {
 			reply.TaskType = TypeMap
 			reply.TaskSeq = mSeq
@@ -87,6 +88,7 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 
 	case PhaseReduce:
 		rSeq, ok := c.reduceQ.pop()
+		log.Printf("redcueSeq: %d assigned to %s\n", rSeq, args.WorkerID)
 		if ok {
 			reply.TaskType = TypeReduce
 			reply.TaskSeq = rSeq
@@ -219,10 +221,12 @@ func (c *Coordinator) keepalive() {
 			wrk := c.workers[taskID]
 			switch wrk.taskType {
 			case TypeMap:
+				log.Printf("mapSeq: %d return to mapQ\n", wrk.taskSeq)
 				c.mapQ.push(wrk.taskSeq)
 				c.mapState[wrk.taskSeq] = StateIdle
 				phaseMap = true
 			case TypeReduce:
+				log.Printf("reduceSeq: %d return to reduceQ\n", wrk.taskSeq)
 				c.reduceQ.push(wrk.taskSeq)
 				c.reduceState[wrk.taskSeq] = StateIdle
 				phaseReduce = true
@@ -239,6 +243,7 @@ func (c *Coordinator) keepalive() {
 		} else if phaseReduce {
 			c.phase.Store(PhaseReduce)
 		}
+		log.Printf("current phase: %v\n", c.phase.Load())
 		time.Sleep(time.Second * 2)
 	}
 }
@@ -294,7 +299,7 @@ func (a ByTime) Less(i, j int) bool { return a[i].assigned.Before(a[j].assigned)
 
 func (c *Coordinator) LogWorker(debug bool) {
 	log.Println("----------------Turn----------------")
-	log.Printf("idleQ: map: %v, reduce: %v\n", c.mapQ.list(), c.reduceQ.list())
+	log.Printf("idleQ: map: %v, reduce: %v\n", c.mapQ.list_read(), c.reduceQ.list_read())
 	wrks := make([]worker, 0)
 	for _, wrk := range c.workers {
 		wrks = append(wrks, *wrk)
