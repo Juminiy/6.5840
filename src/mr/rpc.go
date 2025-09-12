@@ -29,6 +29,19 @@ const (
 	TypeReduce TaskType = 3
 )
 
+func (t TaskType) String() string {
+	switch t {
+	case TypeWait:
+		return "Wait"
+	case TypeMap:
+		return "Map"
+	case TypeReduce:
+		return "Reduce"
+	default:
+		return "None"
+	}
+}
+
 type TaskState int
 
 const (

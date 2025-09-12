@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,21 @@ type worker struct {
 	taskType  TaskType
 	taskSeq   int
 	outputs   []string
+}
+
+func (w *worker) die(cur time.Time, timeout time.Duration) bool {
+	if w.started == nil && cur.Sub(w.assigned) > timeout {
+		return true
+	}
+	if w.started != nil && cur.Sub(*w.started) > timeout {
+		return true
+	}
+	return false
+}
+
+func (w *worker) redo(phase Phase) bool {
+	return w.completed == nil &&
+		((phase == PhaseMap && w.taskType == TypeMap) || (phase == PhaseReduce && w.taskType == TypeReduce))
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -144,6 +160,8 @@ func (c *Coordinator) UpdateTask(args *UpdateTaskArg, reply *UpdateTaskReply) er
 
 func (c *Coordinator) updatePhase() {
 	switch c.phase.Load() {
+	case PhaseDone:
+		return
 	case PhaseMap:
 		if stateCompleted(c.mapState) && c.mapQ.empty() {
 			c.phase.Store(PhaseReduce)
@@ -188,25 +206,31 @@ func (c *Coordinator) keepalive() {
 		curphase := c.phase.Load()
 		evicts := make([]string, 0)
 		c.workerMu.Lock()
+		c.LogWorker(true)
 		for taskID, wrk := range c.workers {
-			if wrk.started == nil || (curtime.Sub(*wrk.started) > c.workerTimeout) {
-				if (curphase == PhaseMap && wrk.taskType == TypeMap) ||
-					(curphase == PhaseReduce && wrk.taskType == TypeReduce && wrk.completed == nil) {
-					evicts = append(evicts, taskID)
-				}
+			if wrk.die(curtime, c.workerTimeout) && wrk.redo(curphase.(Phase)) {
+				evicts = append(evicts, taskID)
 			}
 		}
 		phaseMap, phaseReduce := false, false
 		for _, taskID := range evicts {
+			c.mapMu.Lock()
+			c.reduceMu.Lock()
 			wrk := c.workers[taskID]
 			switch wrk.taskType {
 			case TypeMap:
 				c.mapQ.push(wrk.taskSeq)
+				c.mapState[wrk.taskSeq] = StateIdle
 				phaseMap = true
 			case TypeReduce:
 				c.reduceQ.push(wrk.taskSeq)
+				c.reduceState[wrk.taskSeq] = StateIdle
 				phaseReduce = true
 			}
+			c.mapMu.Unlock()
+			c.reduceMu.Unlock()
+			log.Printf("task: %s-%d, timeout, curtime: %s, requested: %s, assigned: %s, started: %s, completed: %s",
+				wrk.taskType.String(), wrk.taskSeq, curtime, wrk.requested, wrk.assigned, wrk.started, wrk.completed)
 			delete(c.workers, taskID)
 		}
 		c.workerMu.Unlock()
@@ -260,4 +284,30 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.server()
 	go c.keepalive()
 	return &c
+}
+
+type ByTime []worker
+
+func (a ByTime) Len() int           { return len(a) }
+func (a ByTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByTime) Less(i, j int) bool { return a[i].assigned.Before(a[j].assigned) }
+
+func (c *Coordinator) LogWorker(debug bool) {
+	log.Println("----------------Turn----------------")
+	log.Printf("idleQ: map: %v, reduce: %v\n", c.mapQ.list(), c.reduceQ.list())
+	wrks := make([]worker, 0)
+	for _, wrk := range c.workers {
+		wrks = append(wrks, *wrk)
+	}
+	sort.Sort(ByTime(wrks))
+	for _, wrk := range wrks {
+		if debug {
+			log.Printf("taskID: %s, workerID: %s, type: %s, input: %d\n",
+				wrk.taskID, wrk.workerID, wrk.taskType.String(), wrk.taskSeq)
+			continue
+		}
+		log.Printf("taskID: %s, dur: (%s~%s,%dms), workerID: %s, type: %s, input: %d\n",
+			wrk.taskID, *wrk.started, *wrk.completed, wrk.completed.Sub(*wrk.started).Milliseconds(),
+			wrk.workerID, wrk.taskType.String(), wrk.taskSeq)
+	}
 }

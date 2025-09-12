@@ -24,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ofile, _ := os.Create("coordinator.log")
+	ofile, _ := os.Create("mr-coordinator.log")
 	defer ofile.Close()
 	log.SetOutput(ofile)
 	m := mr.MakeCoordinator(os.Args[1:], 10)
@@ -32,5 +32,6 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
+	m.LogWorker(false)
 	time.Sleep(time.Second)
 }

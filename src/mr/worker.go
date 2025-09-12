@@ -38,6 +38,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	task := reqTask(workerID)
 	for {
+		logTask(workerID, task, false)
 		switch task.TaskType {
 		case TypeNone:
 			time.Sleep(time.Second * 1)
@@ -46,6 +47,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			time.Sleep(time.Second * 1)
 		default:
 			workerDo(task, mapf, reducef)
+			logTask(workerID, task, true)
 			task = reqTask(workerID)
 		}
 		time.Sleep(time.Second * 1)
@@ -91,7 +93,7 @@ func workerDo(
 
 	case TypeReduce:
 		var kva []KeyValue
-		log.Printf("reduceSeq: %d, files: %v\n", task.TaskSeq, task.Files)
+		// log.Printf("reduceSeq: %d, files: %v\n", task.TaskSeq, task.Files)
 		for _, interfilename := range task.Files {
 			fptr, err := os.Open(interfilename)
 			if err != nil {
@@ -254,4 +256,17 @@ func parseInterfileSeq(interfile string) int {
 	seqStr := parts[len(parts)-1]
 	seqInt, _ := strconv.ParseInt(seqStr, 10, 64)
 	return int(seqInt)
+}
+
+func logTask(wid string, task ReqTaskReply, done bool) {
+	detail := ""
+	if task.TaskType == TypeMap {
+		detail = fmt.Sprintf("mapSeq: %d", task.TaskSeq)
+	} else if task.TaskType == TypeReduce {
+		detail = fmt.Sprintf("reduceSeq: %d", task.TaskSeq)
+	}
+	if done {
+		detail = fmt.Sprintf("%s, Done", detail)
+	}
+	log.Printf("Worker: %s, Type: %s, Detail: %s\n", wid, task.TaskType.String(), detail)
 }
