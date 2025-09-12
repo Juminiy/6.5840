@@ -12,73 +12,54 @@ import (
 	"time"
 )
 
+type Phase int
+
+const (
+	PhaseMap    Phase = 1
+	PhaseReduce Phase = 2
+	PhaseDone   Phase = 3
+)
+
 type TaskType int
 
 const (
-	TaskWait   TaskType = -1
-	TaskNone   TaskType = 0
-	TaskMap    TaskType = 1
-	TaskReduce TaskType = 2
+	TypeNone   TaskType = 0
+	TypeWait   TaskType = 1
+	TypeMap    TaskType = 2
+	TypeReduce TaskType = 3
 )
-
-func (t TaskType) String() string {
-	switch t {
-	case TaskWait:
-		return "Wait"
-	case TaskMap:
-		return "Map"
-	case TaskReduce:
-		return "Reduce"
-	default:
-		return "None"
-	}
-}
 
 type TaskState int
 
 const (
 	StateIdle       TaskState = 0
-	StateReady      TaskState = 1
+	StateEmit       TaskState = 1
 	StateInProgress TaskState = 2
 	StateCompleted  TaskState = 3
 )
 
-type TaskPhase int
-
-const (
-	PhaseMap    TaskPhase = 1
-	PhaseReduce TaskPhase = 2
-	PhaseDone   TaskPhase = 3
-)
-
 // Add your RPC definitions here.
 type ReqTaskArg struct {
-	WorkderID string
+	WorkerID string
+	ReqTime  time.Time
 }
 type ReqTaskReply struct {
-	TaskID         string
-	TaskType       TaskType
-	RawFilename    string   // TaskMap filename
-	ReduceTh       string   // TaskReduce th
-	Interfilenames []string // TaskReduce filenames
-	ReduceN        int
+	TaskID      string
+	RespTime    time.Time
+	TaskType    TaskType
+	TaskSeq     int
+	ReduceTotal int
+	Files       []string // map-input(*.txt) OR reduce-inter-input(mr-X-Y)
 }
 
 type UpdateTaskArg struct {
-	TaskID   string
-	State    TaskState
-	Time     time.Time
-	Filename []string // result-filename (inters,[...] OR output,[0])
+	TaskID    string
+	ReqTime   time.Time
+	TaskState TaskState
+	Files     []string // map-output(mr-X-Y) OR reduce-output(mr-out-X)
 }
 type UpdateTaskReply struct {
 }
-
-// type KeyReduceArg struct {
-// 	Key string
-// }
-// type KeyReduceReply struct {
-// 	Th int
-// }
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

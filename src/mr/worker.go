@@ -7,14 +7,12 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
-	"math/rand"
 	"net/rpc"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 )
 
 // Map functions return a slice of KeyValue.
@@ -31,86 +29,70 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func getUserID() string {
-	return strconv.Itoa(os.Getuid() + rand.Intn(100))
-}
-
 // main/mrworker.go calls this function.
-func Worker(
-	mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string,
-) {
-	workerID := getUserID() // unique and stable workerID
-	workerLog, _ := os.OpenFile("worker-"+workerID+".log", os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
-	defer workerLog.Close()
-	log.SetOutput(workerLog)
-	task := ReqTask(workerID)
-	for {
-		logTask(workerID, task)
-		switch task.TaskType {
-		case TaskWait:
-			time.Sleep(time.Second * 10)
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	workerID := getWorkerID()
+	logf, _ := os.OpenFile(workerID+".log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	log.SetOutput(logf)
 
-		case TaskNone:
+	task := reqTask(workerID)
+	for {
+		switch task.TaskType {
+		case TypeNone:
 			time.Sleep(time.Second * 1)
 			return
-
-		default:
-			workerRun(task, workerID, mapf, reducef)
+		case TypeWait:
 			time.Sleep(time.Second * 1)
-			task = ReqTask(workerID)
+		default:
+			workerDo(task, mapf, reducef)
+			task = reqTask(workerID)
 		}
+		time.Sleep(time.Second * 1)
 	}
 }
 
-func logTask(wid string, task ReqTaskReply) {
-	detail := ""
-	if task.TaskType == TaskMap {
-		detail = fmt.Sprintf("rawfile: %s", task.RawFilename)
-	} else if task.TaskType == TaskReduce {
-		detail = fmt.Sprintf("th: %s", task.ReduceTh)
-	}
-	log.Printf("Worker: %s, Type: %s, Detail: %s\n", wid, task.TaskType.String(), detail)
-}
-
-func workerRun(task ReqTaskReply,
-	workerID string,
+func workerDo(
+	task ReqTaskReply,
 	mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string,
-) {
-	UpdateTask(UpdateTaskArg{
-		TaskID: task.TaskID,
-		State:  StateInProgress,
-		Time:   time.Now(),
+	reducef func(string, []string) string) {
+
+	updateTask(UpdateTaskArg{
+		TaskID:    task.TaskID,
+		ReqTime:   time.Now(),
+		TaskState: StateInProgress,
 	})
 
-	mapIntersOrReduceOutput := make([]string, 0)
+	outfiles := make([]string, 0)
 	switch task.TaskType {
-	case TaskMap:
-		content, err := readFileContent(task.RawFilename)
-		if err != nil {
-			log.Fatalf("[Worker] readfile: %s, error: %s", task.RawFilename, err.Error())
-		}
-		kva := mapf(task.RawFilename, string(content))
-		// *.txt -> mr-inters-{wid}-{th}
-		inters := map[int][]KeyValue{}
-		for _, kv := range kva {
-			th := ihash(kv.Key) % task.ReduceN // ReduceTh(kv.Key, task.ReduceN)
-			if _, ok := inters[th]; !ok {
-				inters[th] = make([]KeyValue, 0)
+	case TypeMap:
+		for _, inputfile := range task.Files {
+			content, err := readFile(inputfile)
+			if err != nil {
+				log.Fatalf("[Worker] readfile: %s, error: %s", inputfile, err.Error())
 			}
-			inters[th] = append(inters[th], kv)
+			kva := mapf(inputfile, string(content))
+			// *.txt -> mr-X-Y
+			inters := map[int][]KeyValue{}
+			for _, kv := range kva {
+				th := ihash(kv.Key) % task.ReduceTotal // ReduceTh(kv.Key, task.ReduceN)
+				if _, ok := inters[th]; !ok {
+					inters[th] = make([]KeyValue, 0)
+				}
+				inters[th] = append(inters[th], kv)
+			}
+
+			for th, kvs := range inters {
+				interfilename := fmt.Sprintf("mr-%d-%d", task.TaskSeq, th)
+				mapOutput(interfilename, kvs)
+				outfiles = append(outfiles, interfilename)
+			}
 		}
 
-		for th, kvs := range inters {
-			interfilename := fmt.Sprintf("mr-inters-%s-%d", normalizedName(task.RawFilename), th)
-			createInterfile(interfilename, kvs)
-			mapIntersOrReduceOutput = append(mapIntersOrReduceOutput, interfilename)
-		}
-
-	case TaskReduce:
+	case TypeReduce:
 		var kva []KeyValue
-		for _, interfilename := range task.Interfilenames {
+		log.Printf("reduceSeq: %d, files: %v\n", task.TaskSeq, task.Files)
+		for _, interfilename := range task.Files {
 			fptr, err := os.Open(interfilename)
 			if err != nil {
 				log.Fatalf("[Worker] ReduceReadInterfile filename: %s, error: %s", interfilename, err.Error())
@@ -129,72 +111,28 @@ func workerRun(task ReqTaskReply,
 			fptr.Close()
 		}
 
-		// mr-inters-*-{th} -> mr-out-{th}
-		outfilename := "mr-out-" + task.ReduceTh
-		reduceInterfile(kva, outfilename, reducef)
-		mapIntersOrReduceOutput = append(mapIntersOrReduceOutput, outfilename)
+		// mr-X-Y -> mr-out-Y
+		outfilename := fmt.Sprintf("mr-out-%d", task.TaskSeq)
+		reduceOutput(kva, outfilename, reducef)
+		outfiles = append(outfiles, outfilename)
 	}
 
-	UpdateTask(UpdateTaskArg{
-		TaskID:   task.TaskID,
-		State:    StateCompleted,
-		Time:     time.Now(),
-		Filename: mapIntersOrReduceOutput,
+	updateTask(UpdateTaskArg{
+		TaskID:    task.TaskID,
+		ReqTime:   time.Now(),
+		TaskState: StateCompleted,
+		Files:     outfiles,
 	})
 }
 
-// for sorting by key.
-type ByKey []KeyValue
-
-// for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
-func reduceInterfile(intermediate []KeyValue, oname string,
-	reducef func(string, []string) string) {
-
-	sort.Sort(ByKey(intermediate))
-
-	tempfilef(oname, func(fptr *os.File) {
-		i := 0
-		for i < len(intermediate) {
-			j := i + 1
-			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-				j++
-			}
-			values := []string{}
-			for k := i; k < j; k++ {
-				values = append(values, intermediate[k].Value)
-			}
-			output := reducef(intermediate[i].Key, values)
-
-			// this is the correct format for each line of Reduce output.
-			fmt.Fprintf(fptr, "%v %v\n", intermediate[i].Key, output)
-
-			i = j
-		}
-	})
+func reqTask(workerID string) (reply ReqTaskReply) {
+	call("Coordinator.GetTask", &ReqTaskArg{WorkerID: workerID, ReqTime: time.Now()}, &reply)
+	return reply
 }
 
-// RPC Call Wrapper
-func ReqTask(workerID string) ReqTaskReply {
-	task := ReqTaskReply{}
-	call("Coordinator.GetTask", &ReqTaskArg{WorkderID: workerID}, &task)
-	return task
+func updateTask(arg UpdateTaskArg) {
+	call("Coordinator.UpdateTask", &arg, &UpdateTaskReply{})
 }
-
-func UpdateTask(arg UpdateTaskArg) {
-	call("Coordinator.UpdateState", &arg, &UpdateTaskReply{})
-}
-
-// func SaveInters(files []string) {
-// 	call("Coordinator.SaveReduceFiles", &UpdateTaskArg{Filename: files}, &UpdateTaskReply{})
-// }
-
-// func ReduceTh(key string, reduceN int) int {
-// 	return ihash(key) % reduceN
-// }
 
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
@@ -217,9 +155,16 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-// file operation
-func createInterfile(interfilename string, kvs []KeyValue) {
-	tempfilef(interfilename, func(fptr *os.File) {
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func mapOutput(interfilename string, kvs []KeyValue) {
+	tempfileFunc(interfilename, func(fptr *os.File) {
 		enc := json.NewEncoder(fptr)
 		for _, kv := range kvs {
 			if err := enc.Encode(kv); err != nil {
@@ -229,7 +174,53 @@ func createInterfile(interfilename string, kvs []KeyValue) {
 	})
 }
 
-func readFileContent(filename string) ([]byte, error) {
+func reduceOutput(intermediate []KeyValue, oname string,
+	reducef func(string, []string) string) {
+
+	sort.Sort(ByKey(intermediate))
+
+	tempfileFunc(oname, func(fptr *os.File) {
+		i := 0
+		for i < len(intermediate) {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
+			}
+			output := reducef(intermediate[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(fptr, "%v %v\n", intermediate[i].Key, output)
+
+			i = j
+		}
+	})
+}
+
+func tempfileFunc(filename string, fn func(*os.File)) {
+	if fileExists(filename) {
+		log.Printf("rewrite: %s\n", filename)
+		if err := os.Remove(filename); err != nil {
+			log.Printf("[Worker] RemoveAlreadyExistsFile filename: %s, error: %s\n", filename, err.Error())
+		}
+	}
+
+	fptr, err := os.CreateTemp("", filename)
+	if err != nil {
+		log.Fatalf("[Worker] OpenTempfile filename: %s, error: %s", filename, err.Error())
+	}
+	defer fptr.Close()
+	fn(fptr)
+
+	if err := os.Rename(fptr.Name(), filename); err != nil {
+		log.Fatalf("[Worker] RenameTempfile filename: %s, error: %s", filename, err.Error())
+	}
+}
+
+func readFile(filename string) ([]byte, error) {
 	fptr, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -240,40 +231,6 @@ func readFileContent(filename string) ([]byte, error) {
 		return nil, err
 	}
 	return bs, nil
-}
-
-func parseInterfileTh(interfilename string) string {
-	fparts := strings.Split(interfilename, "-")
-	return fparts[len(fparts)-1]
-}
-
-func normalizedName(filename string) string {
-	sbuf := ""
-	for _, ch := range filename {
-		if unicode.IsLetter(ch) || unicode.IsDigit(ch) {
-			sbuf += string(ch)
-		}
-	}
-	return sbuf
-}
-
-func tempfilef(filename string, fn func(*os.File)) {
-	if fileExists(filename) {
-		if err := os.Remove(filename); err != nil {
-			log.Printf("[Worker] RemoveAlreadyExistsFile filename: %s, error: %s\n", filename, err.Error())
-		}
-	}
-
-	fptr, err := os.CreateTemp("", filename) // os.Create(interfilename) // os.OpenFile(interfilename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
-	if err != nil {
-		log.Fatalf("[Worker] OpenTempfile filename: %s, error: %s", filename, err.Error())
-	}
-	defer fptr.Close()
-	fn(fptr)
-
-	if err := os.Rename(fptr.Name(), filename); err != nil {
-		log.Fatalf("[Worker] RenameTempfile filename: %s, error: %s", filename, err.Error())
-	}
 }
 
 func fileExists(filename string) bool {
@@ -287,33 +244,14 @@ func fileExists(filename string) bool {
 	return false
 }
 
-// func interfileMerge(interfilename string, kvs []KeyValue) {
-// 	if fileExists(interfilename) {
-// 		rawcontent, err := readFileContent(interfilename)
-// 		if err != nil {
-// 			log.Fatalf("[Worker] ReadIntermediateFile error: %s", err.Error())
-// 		}
-// 		raw := []KeyValue{}
-// 		// bugs
-// 		if len(rawcontent) > 0 {
-// 			if err := json.Unmarshal([]byte(rawcontent), &raw); err != nil {
-// 				log.Fatalf("[Worker] DecodeIntermediateJSON error: %s", err.Error())
-// 			}
-// 		}
-// 		kvs = append(kvs, raw...)
-// 	}
-// 	newraw, err := json.Marshal(kvs)
-// 	if err != nil {
-// 		log.Fatalf("[Worker] EncodeIntermediateJSON error: %s", err.Error())
-// 	}
-// 	writeContent2File(interfilename, newraw)
-// }
+func getWorkerID() string {
+	return fmt.Sprintf("mr-worker-%d", os.Getpid())
+}
 
-// func writeContent2File(filename string, content []byte) {
-// 	fptr, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0664)
-// 	if err != nil {
-// 		log.Fatalf("[Worker] open file for create_append filename: %s, error: %s", filename, err.Error())
-// 	}
-// 	defer fptr.Close()
-// 	fptr.Write(content)
-// }
+func parseInterfileSeq(interfile string) int {
+	// mr-%d-%d
+	parts := strings.Split(interfile, "-")
+	seqStr := parts[len(parts)-1]
+	seqInt, _ := strconv.ParseInt(seqStr, 10, 64)
+	return int(seqInt)
+}

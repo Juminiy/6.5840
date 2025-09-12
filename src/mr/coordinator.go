@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,182 +14,157 @@ import (
 )
 
 type Coordinator struct {
-	// task
-	ReduceThFiles *sync.Map // th -> intermediate-filenames
-	OutputFiles   *sync.Map // output-filenames
+	mapMu    sync.Mutex
+	mapState map[int]TaskState // mapM -> TaskState
+	mapFile  []string          // mapM -> mapFile, readOnly
+	mapQ     *syncQ[int]
 
-	mapQ    *taskQ // MapTaskQueue
-	reduceQ *taskQ // ReduceTaskQueue
+	reduceMu    sync.Mutex
+	reduceState map[int]TaskState // reduceR -> TaskState
+	reduceFiles map[int][]string  // reduceR -> ReduceFiles
+	reduceQ     *syncQ[int]
 
-	workers *sync.Map // taskID -> *worker
+	outputs []string
 
 	phase atomic.Value
 
-	nReduce       int           // readOnly
-	workerTimeout time.Duration // readOnly
+	workerMu      sync.Mutex
+	workers       map[string]*worker // taskID -> worker
+	workerTimeout time.Duration
+
+	mapM    int // readOnly
+	reduceR int // readOnly
 }
 
 type worker struct {
 	taskID    string
 	workerID  string
+	requested time.Time
 	assigned  time.Time
 	started   *time.Time
 	completed *time.Time
 	taskType  TaskType
-	input     string // Map:filename, Reduce:th
-	output    []string
+	taskSeq   int
+	outputs   []string
 }
 
-const taskQRegularSize = 16
-
-type taskQ struct {
-	mu sync.Mutex
-	tk []string
-}
-
-func newTaskQ(n ...int) *taskQ {
-	return &taskQ{
-		mu: sync.Mutex{},
-		tk: make([]string, 0, func() int {
-			if len(n) > 0 {
-				return n[0]
-			}
-			return taskQRegularSize
-		}()),
-	}
-}
-
-func (q *taskQ) push(tk string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if !slices.Contains(q.tk, tk) {
-		q.tk = append(q.tk, tk)
-	}
-}
-
-func (q *taskQ) front() string {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if len(q.tk) > 0 {
-		return q.tk[0]
-	}
-	return ""
-}
-
-func (q *taskQ) pop() string {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if len(q.tk) > 0 {
-		tk := q.tk[0]
-		q.tk = q.tk[1:]
-		return tk
-	}
-	return ""
-}
-
-func (q *taskQ) empty() bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.tk) == 0
-}
-
-// RPC handlers for the worker to call.
+// Your code here -- RPC handlers for the worker to call.
 
 func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
-	reply.TaskID = genTaskID()
-	reply.TaskType = TaskNone
-	reply.ReduceN = c.nReduce
-	var input string
+	reply.TaskID = uuid.NewString()
+	reply.RespTime = time.Now()
+	reply.TaskType = TypeNone
+	reply.ReduceTotal = c.reduceR
 	switch c.phase.Load() {
 	case PhaseMap:
-		idleMapTask := getIdleV2(c.mapQ) // filename
-		if len(idleMapTask) != 0 {
-			reply.TaskType = TaskMap
-			reply.RawFilename = idleMapTask
-			input = idleMapTask
+		mSeq, ok := c.mapQ.pop()
+		if ok {
+			reply.TaskType = TypeMap
+			reply.TaskSeq = mSeq
+			c.mapMu.Lock()
+			c.mapState[mSeq] = StateEmit
+			reply.Files = []string{c.mapFile[mSeq]}
+			c.mapMu.Unlock()
 		} else {
-			reply.TaskType = TaskWait
+			reply.TaskType = TypeWait
 		}
+
 	case PhaseReduce:
-		idleReduceTask := getIdleV2(c.reduceQ) // th
-		if len(idleReduceTask) != 0 {
-			reply.TaskType = TaskReduce
-			reply.ReduceTh = idleReduceTask
-			thFiles, _ := c.ReduceThFiles.Load(idleReduceTask)
-			thFiles.(*sync.Map).Range(func(filename, _ any) bool {
-				reply.Interfilenames = append(reply.Interfilenames, filename.(string))
-				return true
-			})
-			input = idleReduceTask
+		rSeq, ok := c.reduceQ.pop()
+		if ok {
+			reply.TaskType = TypeReduce
+			reply.TaskSeq = rSeq
+			c.reduceMu.Lock()
+			c.reduceState[rSeq] = StateEmit
+			reply.Files = c.reduceFiles[rSeq]
+			c.reduceMu.Unlock()
 		}
 	}
 
-	// no task left
-	if reply.TaskType == TaskNone || reply.TaskType == TaskWait {
+	if reply.TaskType == TypeWait || reply.TaskType == TypeNone {
 		return nil
 	}
 
-	// update workers
-	c.workers.Store(reply.TaskID, &worker{
-		taskID:   reply.TaskID,
-		workerID: args.WorkderID,
-		assigned: time.Now(),
-		taskType: reply.TaskType,
-		input:    input,
-	})
+	c.workerMu.Lock()
+	c.workers[reply.TaskID] = &worker{
+		taskID:    reply.TaskID,
+		workerID:  args.WorkerID,
+		requested: args.ReqTime,
+		assigned:  time.Now(),
+		taskType:  reply.TaskType,
+		taskSeq:   reply.TaskSeq,
+	}
+	c.workerMu.Unlock()
 	return nil
 }
 
-func (c *Coordinator) UpdateState(args *UpdateTaskArg, reply *UpdateTaskReply) error {
-	wrk, ok := c.workers.Load(args.TaskID) // read from
+func (c *Coordinator) UpdateTask(args *UpdateTaskArg, reply *UpdateTaskReply) error {
+	c.workerMu.Lock()
+	defer c.workerMu.Unlock()
+	worker, ok := c.workers[args.TaskID]
 	if !ok {
 		return nil
 	}
-	worker := wrk.(*worker)
 
-	switch args.State {
-	case StateInProgress:
-		worker.started = &args.Time
-	case StateCompleted:
-		worker.completed = &args.Time
-	}
+	c.mapMu.Lock()
+	defer c.mapMu.Unlock()
+	c.reduceMu.Lock()
+	defer c.reduceMu.Unlock()
 
 	switch worker.taskType {
-	case TaskMap:
-		for _, interfile := range args.Filename {
-			th := parseInterfileTh(interfile)
-			files, _ := c.ReduceThFiles.LoadOrStore(th, &sync.Map{})
-			files.(*sync.Map).Store(interfile, struct{}{})
-			c.reduceQ.push(th)
-			worker.output = append(worker.output, interfile)
-		}
-	case TaskReduce:
-		for _, outfile := range args.Filename { // len must 1
-			c.OutputFiles.Store(outfile, struct{}{})
-			worker.output = []string{outfile}
+	case TypeMap:
+		c.mapState[worker.taskSeq] = args.TaskState
+	case TypeReduce:
+		c.reduceState[worker.taskSeq] = args.TaskState
+	}
+
+	switch args.TaskState {
+	case StateInProgress:
+		worker.started = &args.ReqTime
+	case StateCompleted:
+		worker.completed = &args.ReqTime
+		worker.outputs = args.Files
+		switch worker.taskType {
+		case TypeMap:
+			for _, interfile := range args.Files {
+				seq := parseInterfileSeq(interfile)
+				c.reduceState[seq] = StateIdle
+				c.reduceFiles[seq] = append(c.reduceFiles[seq], interfile)
+			}
+		case TypeReduce:
+			c.outputs = append(c.outputs, args.Files...)
 		}
 	}
 
-	c.workers.Store(args.TaskID, worker) // write back
+	c.workers[args.TaskID] = worker
 
 	c.updatePhase()
 	return nil
 }
 
 func (c *Coordinator) updatePhase() {
-	// update phase by maps
 	switch c.phase.Load() {
-	case PhaseDone:
-		return
 	case PhaseMap:
-		if allCompletedV2(c.mapQ) {
+		if stateCompleted(c.mapState) && c.mapQ.empty() {
 			c.phase.Store(PhaseReduce)
+			for seq := range c.reduceState {
+				c.reduceQ.push(seq)
+			}
 		}
 	case PhaseReduce:
-		if allCompletedV2(c.reduceQ) {
+		if stateCompleted(c.reduceState) && c.reduceQ.empty() {
 			c.phase.Store(PhaseDone)
 		}
 	}
+}
+
+func stateCompleted(states map[int]TaskState) bool {
+	for _, state := range states {
+		if state != StateCompleted {
+			return false
+		}
+	}
+	return true
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -208,35 +181,41 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// for worker-early-exit and worker-crash
+// peek task state(ping worker)
 func (c *Coordinator) keepalive() {
-	for {
-		time.Sleep(time.Second * 1)
-		c.LogWorker(true)
-		disconnects := make([]string, 0)
+	for !c.Done() {
 		curtime := time.Now()
-		c.workers.Range(func(taskID, wrk any) bool {
-			worker := wrk.(*worker)
-			if worker.started == nil ||
-				curtime.Sub(*worker.started) > c.workerTimeout {
-				if worker.taskType == TaskMap ||
-					(worker.taskType == TaskReduce && worker.completed == nil) {
-					disconnects = append(disconnects, taskID.(string))
+		curphase := c.phase.Load()
+		evicts := make([]string, 0)
+		c.workerMu.Lock()
+		for taskID, wrk := range c.workers {
+			if wrk.started == nil || (curtime.Sub(*wrk.started) > c.workerTimeout) {
+				if (curphase == PhaseMap && wrk.taskType == TypeMap) ||
+					(curphase == PhaseReduce && wrk.taskType == TypeReduce && wrk.completed == nil) {
+					evicts = append(evicts, taskID)
 				}
 			}
-			return true
-		})
-		for _, taskID := range disconnects {
-			wrk, _ := c.workers.Load(taskID)
-			worker := wrk.(*worker)
-			switch worker.taskType {
-			case TaskMap:
-				c.mapQ.push(worker.input)
-			case TaskReduce:
-				c.reduceQ.push(worker.input)
-			}
-			c.workers.Delete(taskID)
 		}
+		phaseMap, phaseReduce := false, false
+		for _, taskID := range evicts {
+			wrk := c.workers[taskID]
+			switch wrk.taskType {
+			case TypeMap:
+				c.mapQ.push(wrk.taskSeq)
+				phaseMap = true
+			case TypeReduce:
+				c.reduceQ.push(wrk.taskSeq)
+				phaseReduce = true
+			}
+			delete(c.workers, taskID)
+		}
+		c.workerMu.Unlock()
+		if phaseMap {
+			c.phase.Store(PhaseMap)
+		} else if phaseReduce {
+			c.phase.Store(PhaseReduce)
+		}
+		time.Sleep(time.Second * 2)
 	}
 }
 
@@ -250,82 +229,35 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	mapM := len(files)
 	c := Coordinator{
-		ReduceThFiles: &sync.Map{},
-		OutputFiles:   &sync.Map{},
-		mapQ:          newTaskQ(len(files)),
-		reduceQ:       newTaskQ(nReduce),
-		workers:       &sync.Map{},
-		phase:         atomic.Value{},
-		nReduce:       nReduce,
+		mapMu:    sync.Mutex{},
+		mapState: make(map[int]TaskState, mapM),
+		mapFile:  files,
+		mapQ:     makeQ[int](mapM),
+
+		reduceMu:    sync.Mutex{},
+		reduceState: make(map[int]TaskState, nReduce),
+		reduceFiles: make(map[int][]string, nReduce),
+		reduceQ:     makeQ[int](nReduce),
+
+		outputs: make([]string, 0, nReduce),
+		phase:   atomic.Value{},
+
+		workerMu:      sync.Mutex{},
+		workers:       make(map[string]*worker, mapM+nReduce),
 		workerTimeout: time.Second * 10,
-	}
-	for _, inputfile := range files {
-		c.mapQ.push(inputfile)
+
+		mapM:    mapM,
+		reduceR: nReduce,
 	}
 	c.phase.Store(PhaseMap)
+	for idx := range files {
+		c.mapState[idx] = StateIdle
+		c.mapQ.push(idx)
+	}
 
 	c.server()
 	go c.keepalive()
 	return &c
 }
-
-type ByTime []worker
-
-func (a ByTime) Len() int           { return len(a) }
-func (a ByTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByTime) Less(i, j int) bool { return a[i].assigned.Before(a[j].assigned) }
-
-// inspect execution details of workers
-func (c *Coordinator) LogWorker(debug bool) {
-	workers := make([]worker, 0)
-	c.workers.Range(func(_, wrk any) bool {
-		workers = append(workers, *wrk.(*worker))
-		return true
-	})
-	sort.Sort(ByTime(workers))
-	log.Println("----------------Turns----------------")
-	for _, worker := range workers {
-		if debug {
-			log.Printf("taskID: %s, workerID: %s, input: %s\n", worker.taskID, worker.workerID, worker.input)
-			continue
-		}
-		log.Printf("taskID: %s, dur: (%s~%s,%dms), workerID: %s, input: %s\n", worker.taskID, *worker.started, *worker.completed, worker.completed.Sub(*worker.started).Milliseconds(), worker.workerID, worker.input)
-	}
-}
-
-func genTaskID() string {
-	return uuid.NewString()
-}
-
-func getIdleV2(tk *taskQ) string {
-	return tk.pop()
-}
-
-func allCompletedV2(tk *taskQ) bool {
-	return tk.empty()
-}
-
-// func getIdle(tasks *sync.Map) string {
-// 	taskt := ""
-// 	tasks.Range(func(t any, state any) bool {
-// 		if state == StateIdle {
-// 			taskt = t.(string)
-// 			return false
-// 		}
-// 		return true
-// 	})
-// 	return taskt
-// }
-
-// func allCompleted(tasks *sync.Map) bool {
-// 	ok := true
-// 	tasks.Range(func(_, state any) bool {
-// 		if state != StateCompleted {
-// 			ok = false
-// 			return false
-// 		}
-// 		return true
-// 	})
-// 	return ok
-// }
