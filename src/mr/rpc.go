@@ -20,6 +20,17 @@ const (
 	PhaseDone   Phase = 3
 )
 
+func (p Phase) String() string {
+	switch p {
+	case PhaseMap:
+		return "PhaseMap"
+	case PhaseReduce:
+		return "PhaseReduce"
+	default:
+		return "PhaseDone"
+	}
+}
+
 type TaskType int
 
 const (
@@ -50,6 +61,21 @@ const (
 	StateInProgress TaskState = 2
 	StateCompleted  TaskState = 3
 )
+
+func (s TaskState) String() string {
+	switch s {
+	case StateIdle:
+		return "StateIdle"
+	case StateEmit:
+		return "StateEmit"
+	case StateInProgress:
+		return "StateInProgress"
+	case StateCompleted:
+		return "StateCompleted"
+	default:
+		return "StateNone"
+	}
+}
 
 // Add your RPC definitions here.
 type ReqTaskArg struct {

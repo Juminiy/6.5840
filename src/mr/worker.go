@@ -36,26 +36,21 @@ func Worker(mapf func(string, string) []KeyValue,
 	logf, _ := os.OpenFile(workerID+".log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	log.SetOutput(logf)
 
-	task := reqTask(workerID)
-	for {
-		logTask(workerID, task, false)
+	for task := reqTask(workerID); task.TaskType != TypeNone; task = reqTask(workerID) {
+		logTask(workerID, task, false) // received task
 		switch task.TaskType {
-		case TypeNone:
-			time.Sleep(time.Second * 1)
-			return
 		case TypeWait:
 			time.Sleep(time.Second * 1)
 		default:
 			workerDo(task, mapf, reducef)
-			logTask(workerID, task, true)
-			task = reqTask(workerID)
+			logTask(workerID, task, true) // finished task
 		}
 		time.Sleep(time.Second * 1)
 	}
 }
 
 func workerDo(
-	task ReqTaskReply,
+	task *ReqTaskReply,
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -127,8 +122,9 @@ func workerDo(
 	})
 }
 
-func reqTask(workerID string) (reply ReqTaskReply) {
-	call("Coordinator.GetTask", &ReqTaskArg{WorkerID: workerID, ReqTime: time.Now()}, &reply)
+func reqTask(workerID string) *ReqTaskReply {
+	reply := &ReqTaskReply{}
+	call("Coordinator.GetTask", &ReqTaskArg{WorkerID: workerID, ReqTime: time.Now()}, reply)
 	return reply
 }
 
@@ -258,7 +254,7 @@ func parseInterfileSeq(interfile string) int {
 	return int(seqInt)
 }
 
-func logTask(wid string, task ReqTaskReply, done bool) {
+func logTask(wid string, task *ReqTaskReply, done bool) {
 	detail := ""
 	if task.TaskType == TypeMap {
 		detail = fmt.Sprintf("mapSeq: %d", task.TaskSeq)
@@ -268,5 +264,5 @@ func logTask(wid string, task ReqTaskReply, done bool) {
 	if done {
 		detail = fmt.Sprintf("%s, Done", detail)
 	}
-	log.Printf("Worker: %s, Type: %s, Detail: %s\n", wid, task.TaskType.String(), detail)
+	log.Printf("Worker: %s, Req: %p, Type: %s, Detail: %s\n", wid, task, task.TaskType.String(), detail)
 }

@@ -72,10 +72,13 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 	reply.TaskType = TypeNone
 	reply.ReduceTotal = c.reduceR
 	switch c.phase.Load() {
+	case PhaseDone:
+		return nil
 	case PhaseMap:
 		mSeq, ok := c.mapQ.pop()
-		log.Printf("mapSeq: %d assigned to %s\n", mSeq, args.WorkerID)
+		// log.Printf("mapQ: %v\n", c.mapQ.list_read())
 		if ok {
+			// log.Printf("curtime: %s, mapSeq: %d assigned to %s\n", time.Now(), mSeq, args.WorkerID)
 			reply.TaskType = TypeMap
 			reply.TaskSeq = mSeq
 			c.mapMu.Lock()
@@ -88,8 +91,9 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 
 	case PhaseReduce:
 		rSeq, ok := c.reduceQ.pop()
-		log.Printf("redcueSeq: %d assigned to %s\n", rSeq, args.WorkerID)
+		// log.Printf("reduceQ: %v\n", c.reduceQ.list_read())
 		if ok {
+			// log.Printf("curtime: %s, redcueSeq: %d assigned to %s\n", time.Now(), rSeq, args.WorkerID)
 			reply.TaskType = TypeReduce
 			reply.TaskSeq = rSeq
 			c.reduceMu.Lock()
@@ -97,6 +101,8 @@ func (c *Coordinator) GetTask(args *ReqTaskArg, reply *ReqTaskReply) error {
 			reply.Files = c.reduceFiles[rSeq]
 			c.reduceMu.Unlock()
 		}
+	default:
+		log.Fatalf("[Coordinator] GetTask NotCaught Phase: %s", c.phase.Load())
 	}
 
 	if reply.TaskType == TypeWait || reply.TaskType == TypeNone {
@@ -221,12 +227,12 @@ func (c *Coordinator) keepalive() {
 			wrk := c.workers[taskID]
 			switch wrk.taskType {
 			case TypeMap:
-				log.Printf("mapSeq: %d return to mapQ\n", wrk.taskSeq)
+				// log.Printf("mapSeq: %d return to mapQ\n", wrk.taskSeq)
 				c.mapQ.push(wrk.taskSeq)
 				c.mapState[wrk.taskSeq] = StateIdle
 				phaseMap = true
 			case TypeReduce:
-				log.Printf("reduceSeq: %d return to reduceQ\n", wrk.taskSeq)
+				// log.Printf("reduceSeq: %d return to reduceQ\n", wrk.taskSeq)
 				c.reduceQ.push(wrk.taskSeq)
 				c.reduceState[wrk.taskSeq] = StateIdle
 				phaseReduce = true
@@ -243,7 +249,7 @@ func (c *Coordinator) keepalive() {
 		} else if phaseReduce {
 			c.phase.Store(PhaseReduce)
 		}
-		log.Printf("current phase: %v\n", c.phase.Load())
+		// log.Printf("current phase: %s\n", c.phase.Load())
 		time.Sleep(time.Second * 2)
 	}
 }
