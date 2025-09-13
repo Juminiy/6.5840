@@ -36,9 +36,12 @@ func Worker(mapf func(string, string) []KeyValue,
 	logf, _ := os.OpenFile(workerID+".log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	log.SetOutput(logf)
 
-	for task := reqTask(workerID); task.TaskType != TypeNone; task = reqTask(workerID) {
+	for task := reqTask(workerID); ; task = reqTask(workerID) {
 		logTask(workerID, task, false) // received task
 		switch task.TaskType {
+		case TypeNone:
+			time.Sleep(time.Second * 2)
+			return
 		case TypeWait:
 			time.Sleep(time.Second * 1)
 		default:
