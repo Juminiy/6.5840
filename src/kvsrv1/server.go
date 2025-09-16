@@ -62,6 +62,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 			vVer.value = args.Value
 			vVer.version += 1
 			reply.Err = rpc.OK
+			// logLatest(args.Key, vVer.value, vVer.version)
 		} else {
 			reply.Err = rpc.ErrVersion
 		}
@@ -69,6 +70,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		if args.Version == 0 {
 			kv.store[args.Key] = &vver{value: args.Value, version: 1}
 			reply.Err = rpc.OK
+			// logLatest(args.Key, args.Value, 1)
 		} else {
 			reply.Err = rpc.ErrNoKey
 		}
@@ -83,4 +85,8 @@ func (kv *KVServer) Kill() {
 func StartKVServer(ends []*labrpc.ClientEnd, gid tester.Tgid, srv int, persister *tester.Persister) []tester.IService {
 	kv := MakeKVServer()
 	return []tester.IService{kv}
+}
+
+func logLatest(key string, value string, ver rpc.Tversion) {
+	log.Printf("key: %s, value: %s, ver: %d\n", key, value, ver)
 }
