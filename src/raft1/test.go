@@ -11,7 +11,7 @@ import (
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -155,7 +155,7 @@ func (ts *Test) checkNoLeader() {
 			if is_leader {
 				details := fmt.Sprintf("leader = %v", i)
 				tester.AnnotateCheckerFailure("unexpected leader found", details)
-				ts.Fatalf(details)
+				ts.Fatalf("leader = %v", i)
 			}
 		}
 	}
@@ -196,7 +196,8 @@ func (ts *Test) nCommitted(index int) (int, any) {
 				text := fmt.Sprintf("committed values at index %v do not match (%v != %v)",
 					index, cmd, cmd1)
 				tester.AnnotateCheckerFailure("unmatched committed values", text)
-				ts.Fatalf(text)
+				ts.Fatalf("committed values at index %v do not match (%v != %v)",
+					index, cmd, cmd1)
 			}
 			count += 1
 			cmd = cmd1
