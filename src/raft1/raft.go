@@ -156,10 +156,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = args.Term
-	if currentVote, ok := rf.votedFor[args.Term]; !ok || currentVote == args.CandidateId {
+	if args.Term > rf.currentTerm {
+		rf.currentRole = Follower
+		rf.currentLeader = -1
+		rf.currentTerm = args.Term
 		reply.VoteGranted = true
 		rf.latest = time.Now()
+	} else { // args.Term == rf.currentTerm
+		switch rf.currentRole {
+		case Follower:
+			rf.currentLeader = -1
+			if currentVote, ok := rf.votedFor[args.Term]; !ok || currentVote == args.CandidateId {
+				reply.VoteGranted = true
+				rf.latest = time.Now()
+			}
+		case Candidate:
+
+		case Leader:
+
+		}
 	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -217,11 +234,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	reply.Term = args.Term
 	rf.currentLeader = args.LeaderId
 	rf.currentRole = Follower
 	rf.currentTerm = args.Term
 	rf.latest = time.Now()
-	reply.Term = args.Term
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -270,7 +288,9 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) startElection() {
-	for rf.currentRole == Follower {
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+	for rf.currentRole != Leader {
 		rf.currentRole = Candidate
 		rf.currentLeader = -1
 		rf.currentTerm += 1
@@ -307,15 +327,17 @@ func (rf *Raft) startElection() {
 			rf.currentRole = Leader
 			go rf.heartBeat()
 			break
-		} else if atomic.LoadInt64(&rf.currentTerm) < latestTerm { // latest
+		} else if rf.currentTerm < latestTerm { // latest
 			rf.currentRole = Follower
-			atomic.StoreInt64(&rf.currentTerm, latestTerm)
+			rf.currentTerm = latestTerm
 			break
 		}
 	}
 }
 
 func (rf *Raft) heartBeat() {
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
 	for rf.currentRole == Leader {
 
 		var latestTerm int64
@@ -339,7 +361,7 @@ func (rf *Raft) heartBeat() {
 		}
 		eg.Wait()
 
-		if atomic.LoadInt64(&rf.currentTerm) < latestTerm {
+		if rf.currentTerm < latestTerm {
 			rf.currentLeader = -1
 			rf.currentTerm = latestTerm
 			rf.currentRole = Follower
