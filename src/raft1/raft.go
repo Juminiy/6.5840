@@ -69,7 +69,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Your code here (3A).
-	return int(rf.currentTerm), rf.currentLeader == rf.me
+	return int(rf.currentTerm), rf.currentRole == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -291,10 +291,13 @@ func (rf *Raft) startElection() {
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
 	for rf.currentRole != Leader {
+		rf.mu.Lock()
 		rf.currentRole = Candidate
 		rf.currentLeader = -1
 		rf.currentTerm += 1
 		rf.votedFor[rf.currentTerm] = rf.me
+		curTerm := rf.currentTerm
+		rf.mu.Unlock()
 
 		var voteCnt int64
 		var latestTerm int64
@@ -304,7 +307,7 @@ func (rf *Raft) startElection() {
 			if peerIdx != rf.me {
 				eg.Go(func() error {
 					args, reply := RequestVoteArgs{
-						Term:        rf.currentTerm,
+						Term:        curTerm,
 						CandidateId: rf.me,
 					}, RequestVoteReply{}
 					if rf.sendRequestVote(peerIdx, &args, &reply) {
@@ -323,15 +326,21 @@ func (rf *Raft) startElection() {
 		eg.Wait()
 
 		if voteCnt+1 > int64(len(rf.peers)/2) { // win
+			rf.mu.Lock()
 			rf.currentLeader = rf.me
 			rf.currentRole = Leader
+			rf.mu.Unlock()
 			go rf.heartBeat()
 			break
-		} else if rf.currentTerm < latestTerm { // latest
+		} else if curTerm < latestTerm { // latest
+			rf.mu.Lock()
 			rf.currentRole = Follower
 			rf.currentTerm = latestTerm
+			rf.currentLeader = -1
+			rf.mu.Unlock()
 			break
 		}
+
 	}
 }
 
@@ -339,6 +348,9 @@ func (rf *Raft) heartBeat() {
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
 	for rf.currentRole == Leader {
+		rf.mu.Lock()
+		curTerm := rf.currentTerm
+		rf.mu.Unlock()
 
 		var latestTerm int64
 
@@ -347,7 +359,7 @@ func (rf *Raft) heartBeat() {
 			if peerIdx != rf.me {
 				eg.Go(func() error {
 					args, reply := AppendEntriesArgs{
-						Term:     rf.currentTerm,
+						Term:     curTerm,
 						LeaderId: rf.me,
 					}, AppendEntriesReply{}
 					if rf.sendAppendEntries(peerIdx, &args, &reply) {
@@ -361,10 +373,12 @@ func (rf *Raft) heartBeat() {
 		}
 		eg.Wait()
 
-		if rf.currentTerm < latestTerm {
+		if curTerm < latestTerm {
+			rf.mu.Lock()
 			rf.currentLeader = -1
 			rf.currentTerm = latestTerm
 			rf.currentRole = Follower
+			rf.mu.Unlock()
 			break
 		}
 
@@ -377,8 +391,12 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		if rf.currentRole == Follower &&
-			time.Since(rf.latest) > 450*time.Millisecond {
+		rf.mu.Lock()
+		curRole := rf.currentRole
+		curTime := rf.latest
+		rf.mu.Unlock()
+		if curRole == Follower &&
+			time.Since(curTime) > timeDurMs(350, 450) {
 			rf.startElection()
 		}
 
